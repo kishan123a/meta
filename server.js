@@ -51,34 +51,112 @@ app.get('/', (req, res) => {
 });
 
 // --- UPDATED: Webhook to receive forwarded responses and SAVE TO DB ---
+// Replace the existing '/api/forwarded-response' in your server.js
+
+// This endpoint receives forwarded data and processes different message types
 app.post('/api/forwarded-response', async (req, res) => {
-    const forwardedData = req.body;
-    console.log("✅ Received forwarded data from central router:");
-    console.log(JSON.stringify(forwardedData, null, 2));
+  const data = req.body;
+  console.log('Received Forwarded Data:', JSON.stringify(data, null, 2));
+  
+  try {
+    const change = data.entry?.[0]?.changes?.[0]?.value;
+    if (!change) return res.sendStatus(200);
 
-    try {
-        if (forwardedData.object === 'whatsapp_business_account' && forwardedData.entry[0]?.changes[0]?.value?.messages) {
-            const message = forwardedData.entry[0].changes[0].value.messages[0];
-            const phoneNumber = message.from;
-            const wamid = message.id;
-            const content = message.text.body;
-            const timestamp = new Date(parseInt(message.timestamp, 10) * 1000);
+    // Handle incoming messages of various types
+    if (change.messages) {
+      const msg = change.messages[0];
+      let content = '[Unsupported Message Type]';
+      const messageType = msg.type;
 
-            const insertQuery = `
-                INSERT INTO chat_messages (phone_number, wamid, direction, content, timestamp)
-                VALUES ($1, $2, 'incoming', $3, $4)
-                ON CONFLICT (wamid) DO NOTHING;
-            `;
-            await pool.query(insertQuery, [phoneNumber, wamid, content, timestamp]);
-            console.log(`Saved incoming message from ${phoneNumber} to DB.`);
-        }
-    } catch (dbError) {
-        console.error('Error saving incoming message to DB:', dbError);
+      switch (messageType) {
+        case 'text':
+          content = msg.text.body;
+          break;
+        case 'image':
+          content = `📷 [Image] ${msg.image.caption || ''}`.trim();
+          break;
+        case 'audio':
+          content = `🎵 [Audio Message]`;
+          break;
+        case 'video':
+          content = `🎥 [Video] ${msg.video.caption || ''}`.trim();
+          break;
+        case 'document':
+          content = `📄 [Document] ${msg.document.filename || 'File'}`;
+          break;
+        case 'sticker':
+          content = `😀 [Sticker]`;
+          break;
+        case 'reaction':
+          const reactedMessageId = msg.reaction.message_id;
+          const emoji = msg.reaction.emoji || '👍';
+          await pool.query(
+            `UPDATE chat_messages SET status = $1 WHERE wamid = $2`,
+            [`Reacted with ${emoji}`, reactedMessageId]
+          );
+          return res.sendStatus(200); // Stop here, no new message needed
+      }
+
+      await pool.query(
+        'INSERT INTO chat_messages (phone_number, wamid, direction, content, status) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (wamid) DO NOTHING',
+        [msg.from, msg.id, 'incoming', content, 'read']
+      );
+      console.log(`📥 ${messageType} message saved to DB`);
     }
-
-    res.status(200).send({ status: "success", message: "Data received" });
+    
+    // Handle status updates
+    else if (change.statuses) {
+      const status_data = change.statuses[0];
+      await pool.query(
+        'UPDATE chat_messages SET status = $1 WHERE wamid = $2',
+        [status_data.status, status_data.id]
+      );
+      console.log(`ℹ️ Message status updated to ${status_data.status}`);
+    }
+  } catch (error) {
+    console.error('Error processing forwarded data:', error);
+  }
+  
+  res.sendStatus(200);
 });
 
+// Send Message Endpoint (unchanged)
+app.post('/send-message', async (req, res) => {
+  const { to, type, messageBody, templateName, headerImageUrl } = req.body;
+  if (!to || !type) return res.status(400).json({ error: 'Recipient and type are required.' });
+
+  const url = `${META_API_URL}/${PHONE_NUMBER_ID}/messages`;
+  const headers = { "Authorization": `Bearer ${META_ACCESS_TOKEN}`, "Content-Type": "application/json" };
+  let payload = { "messaging_product": "whatsapp", "to": to, "type": type };
+  let content_to_save = "";
+
+  if (type === 'text') {
+    payload.text = { "body": messageBody };
+    content_to_save = messageBody;
+  } else if (type === 'template') {
+    payload.template = { "name": templateName, "language": { "code": "en_US" } };
+    content_to_save = `Sent template: ${templateName}`;
+    if (headerImageUrl) {
+      payload.template.components = [{"type": "header", "parameters": [{"type": "image", "image": {"link": headerImageUrl}}]}];
+    }
+  }
+
+  try {
+    const response = await axios.post(url, payload, { headers });
+    const responseData = response.data;
+    if (response.status === 200 && responseData.messages?.[0]?.id) {
+      await pool.query(
+        'INSERT INTO chat_messages (phone_number, wamid, direction, content, status) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (wamid) DO NOTHING',
+        [to, responseData.messages[0].id, 'outgoing', content_to_save, 'sent']
+      );
+      console.log('📤 Outgoing message saved to DB');
+    }
+    res.status(200).json(responseData);
+  } catch (error) {
+    console.error('Error sending message:', error.response?.data || error.message);
+    res.status(500).json(error.response?.data || { error: 'Failed to send message' });
+  }
+});
 // --- NEW: Endpoint to fetch chat history from the database ---
 app.get('/api/history/:phoneNumber', async (req, res) => {
   const { phoneNumber } = req.params;
@@ -97,53 +175,53 @@ app.get('/api/history/:phoneNumber', async (req, res) => {
   }
 });
 
-// --- UPDATED: Send a message and SAVE TO DB ---
-app.post('/send-message', async (req, res) => {
-    const { to, type, messageBody, templateName, languageCode = 'en', headerImageUrl } = req.body;
+// // --- UPDATED: Send a message and SAVE TO DB ---
+// app.post('/send-message', async (req, res) => {
+//     const { to, type, messageBody, templateName, languageCode = 'en', headerImageUrl } = req.body;
 
-    if (!to || !type) {
-        return res.status(400).json({ error: 'Recipient phone number (to) and message type are required.' });
-    }
+//     if (!to || !type) {
+//         return res.status(400).json({ error: 'Recipient phone number (to) and message type are required.' });
+//     }
 
-    let payload = { messaging_product: 'whatsapp', to, type };
-    let contentForDb = '';
+//     let payload = { messaging_product: 'whatsapp', to, type };
+//     let contentForDb = '';
 
-    if (type === 'template') {
-        if (!templateName) return res.status(400).json({ error: 'templateName is required' });
-        payload.template = { name: templateName, language: { code: languageCode } };
-        if (headerImageUrl) {
-            payload.template.components = [{"type": "header", "parameters": [{"type": "image", "image": {"link": headerImageUrl}}]}];
-        }
-        contentForDb = `Template: ${templateName}`;
-    } else if (type === 'text') {
-        if (!messageBody) return res.status(400).json({ error: 'messageBody is required' });
-        payload.text = { body: messageBody };
-        contentForDb = messageBody;
-    } else {
-        return res.status(400).json({ error: 'Invalid message type' });
-    }
+//     if (type === 'template') {
+//         if (!templateName) return res.status(400).json({ error: 'templateName is required' });
+//         payload.template = { name: templateName, language: { code: languageCode } };
+//         if (headerImageUrl) {
+//             payload.template.components = [{"type": "header", "parameters": [{"type": "image", "image": {"link": headerImageUrl}}]}];
+//         }
+//         contentForDb = `Template: ${templateName}`;
+//     } else if (type === 'text') {
+//         if (!messageBody) return res.status(400).json({ error: 'messageBody is required' });
+//         payload.text = { body: messageBody };
+//         contentForDb = messageBody;
+//     } else {
+//         return res.status(400).json({ error: 'Invalid message type' });
+//     }
 
-    try {
-        const response = await axios.post(`${META_API_URL}/${PHONE_NUMBER_ID}/messages`, payload, {
-            headers: { 'Authorization': `Bearer ${WHATSAPP_ACCESS_TOKEN}` }
-        });
+//     try {
+//         const response = await axios.post(`${META_API_URL}/${PHONE_NUMBER_ID}/messages`, payload, {
+//             headers: { 'Authorization': `Bearer ${WHATSAPP_ACCESS_TOKEN}` }
+//         });
 
-        // Save the outgoing message to the database
-        const wamid = response.data.messages[0].id;
-        const insertQuery = `
-            INSERT INTO chat_messages (phone_number, wamid, direction, content, timestamp)
-            VALUES ($1, $2, 'outgoing', $3, NOW())
-            ON CONFLICT (wamid) DO NOTHING;
-        `;
-        await pool.query(insertQuery, [to, wamid, contentForDb]);
-        console.log(`Saved outgoing message to ${to} in DB.`);
+//         // Save the outgoing message to the database
+//         const wamid = response.data.messages[0].id;
+//         const insertQuery = `
+//             INSERT INTO chat_messages (phone_number, wamid, direction, content, timestamp)
+//             VALUES ($1, $2, 'outgoing', $3, NOW())
+//             ON CONFLICT (wamid) DO NOTHING;
+//         `;
+//         await pool.query(insertQuery, [to, wamid, contentForDb]);
+//         console.log(`Saved outgoing message to ${to} in DB.`);
         
-        res.status(200).json(response.data);
-    } catch (error) {
-        console.error('Error sending message:', error.response ? error.response.data : error.message);
-        res.status(500).json(error.response ? error.response.data : { message: error.message });
-    }
-});
+//         res.status(200).json(response.data);
+//     } catch (error) {
+//         console.error('Error sending message:', error.response ? error.response.data : error.message);
+//         res.status(500).json(error.response ? error.response.data : { message: error.message });
+//     }
+// });
 
 
 // --- Your other endpoints remain the same ---
