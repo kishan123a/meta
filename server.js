@@ -47,7 +47,6 @@ app.get('/', (req, res) => {
 });
 
 // --- Add this to serve the React Frontend in production ---
-const path = require('path');
 
 // Serve static files from the React app
 app.use(express.static(path.join(__dirname, '../frontend/build')));
