@@ -121,7 +121,7 @@ app.post('/api/forwarded-response', async (req, res) => {
 });
 
 // Send Message Endpoint (unchanged)
-app.post('/send-message', async (req, res) => {
+app.post('/api/send-message', async (req, res) => {
   const { to, type, messageBody, templateName, headerImageUrl } = req.body;
   if (!to || !type) return res.status(400).json({ error: 'Recipient and type are required.' });
 
